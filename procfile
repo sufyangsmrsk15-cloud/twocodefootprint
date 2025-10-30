@@ -1,1 +1,1 @@
-worker: python pro_liquidity_bot.py
+worker: python bot.py
