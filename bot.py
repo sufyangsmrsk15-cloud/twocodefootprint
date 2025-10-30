@@ -1,10 +1,13 @@
 """
-Liquidity Matrix Telegram Bot - SHORT SETUP ONLY (New York Session)
-Auto starts 5:00 PM PKT → 10:00 PM PKT
+Liquidity Matrix Telegram Bot - Real-Time Setup Alert
+--------------------------------
+1st Alert: Pre-NY liquidity snapshot (4:55 PM PK)
+2nd Alert: Only when setup found + price touches entry zone (anytime during NY session)
 """
 
 import os
 import time
+import json
 import math
 import requests
 from datetime import datetime, timedelta, time as dtime
@@ -15,17 +18,24 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TD_API_KEY = os.getenv("TWELVE_API_KEY")
 
+# Trading symbols
 SYMBOL_XAU = "XAU/USD"
 SYMBOL_BTC = "BTC/USD"
 
-NY_SESSION_START_PK = dtime(hour=17, minute=0)
-NY_SESSION_END_PK = dtime(hour=22, minute=0)
+# Session times (Pakistan Time)
+NY_SESSION_START_PK = dtime(hour=17, minute=0)  # 5:00 PM PK
+NY_SESSION_END_PK = dtime(hour=22, minute=0)    # 10:00 PM PK
 
+# Strategy params
 XAU_SL_PIPS = 20
 BTC_SL_USD = 350
 RR = 4
 
-current_setups = {"XAU": None, "BTC": None}
+# Global variables to track setups
+current_setups = {
+    "XAU": None,
+    "BTC": None
+}
 
 # ------------------ HELPERS ------------------
 
@@ -33,10 +43,10 @@ def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
     except Exception as e:
-        print("Telegram Error:", e)
+        print("Telegram send error:", e)
 
 def twelvedata_get_series(symbol: str, interval: str = "15min", outputsize: int = 100):
     base = "https://api.twelvedata.com/time_series"
@@ -45,130 +55,90 @@ def twelvedata_get_series(symbol: str, interval: str = "15min", outputsize: int 
         "interval": interval,
         "outputsize": outputsize,
         "format": "JSON",
-        "apikey": TD_API_KEY,
+        "apikey": TD_API_KEY
     }
     r = requests.get(base, params=params, timeout=12)
+    r.raise_for_status()
     data = r.json()
-    return list(reversed(data["values"])) if "values" in data else []
+    if "values" not in data:
+        raise RuntimeError(f"TwelveData error: {data}")
+    return list(reversed(data["values"]))
 
-def parse_candles(raw):
-    candles = []
-    for c in raw:
-        candles.append({
+def parse_candles(raw_candles):
+    out = []
+    for c in raw_candles:
+        out.append({
             "datetime": datetime.fromisoformat(c["datetime"]),
             "open": float(c["open"]),
             "high": float(c["high"]),
             "low": float(c["low"]),
-            "close": float(c["close"])
+            "close": float(c["close"]),
+            "volume": float(c.get("volume") or 0)
         })
-    return candles
+    return out
 
 def get_current_price(symbol):
     try:
         data = twelvedata_get_series(symbol, "1min", 1)
-        return float(data[0]["close"]) if data else None
-    except:
-        return None
+        if data:
+            return float(data[0]['close'])
+    except Exception as e:
+        print(f"Error getting current price for {symbol}: {e}")
+    return None
 
 # ------------------ STRATEGY LOGIC ------------------
 
-def detect_sweep_and_red(candles, lookback=6):
-    """Detect bearish sweep (fake high + red close)."""
-    if len(candles) < lookback + 2:
+def detect_sweep_and_green(candles_15m, lookback=6):
+    if len(candles_15m) < lookback+2:
         return {"signal": False}
-    window = candles[-(lookback + 1):]
-    for i in range(1, len(window) - 1):
-        if window[i]["high"] > window[i-1]["high"] and window[i]["high"] > window[i+1]["high"]:
+    window = candles_15m[-(lookback+1):]
+    for i in range(1, len(window)-1):
+        if window[i]["low"] < window[i-1]["low"] and window[i]["low"] < window[i+1]["low"]:
             body = abs(window[i]["open"] - window[i]["close"])
-            upper_wick = window[i]["high"] - max(window[i]["open"], window[i]["close"])
-            if upper_wick / (window[i]["high"] - window[i]["low"]) > 0.4:
-                next_candle = window[i + 1]
-                if next_candle["close"] < next_candle["open"]:
-                    return {"signal": True, "sweep": window[i], "confirm": next_candle}
+            lower_wick = window[i]["close"] - window[i]["low"]
+            range_ = window[i]["high"] - window[i]["low"]
+            if lower_wick / range_ > 0.4 and window[i+1]["close"] > window[i+1]["open"]:
+                return {"signal": True, "sweep_candle": window[i], "confirm_candle": window[i+1]}
     return {"signal": False}
 
-def calculate_dynamic_support(candles, lookback=10):
-    return min(c["low"] for c in candles[-lookback:])
+def compute_liquidity_zones(candles):
+    lows = [c["low"] for c in candles]
+    highs = [c["high"] for c in candles]
+    return {"recent_low": min(lows), "recent_high": max(highs), "last_close": candles[-1]["close"]}
 
-def build_short_plan(symbol, candles, detection, sl_pips):
-    sweep = detection["sweep"]
-    confirm = detection["confirm"]
-    support = calculate_dynamic_support(candles)
-    if confirm["close"] < support and confirm["close"] < (confirm["high"] - (confirm["high"] - confirm["low"]) * 0.5):
-        entry = support
-        sl = sweep["high"] + sl_pips * 0.01
-        tp = entry - (entry - sl) * RR
-        tp1 = entry - (entry - sl)
-        return {
-            "symbol": symbol,
-            "side": "SHORT",
-            "entry": round(entry, 3),
-            "sl": round(sl, 3),
-            "tp": round(tp, 3),
-            "tp1": round(tp1, 3),
-            "logic": f"Dynamic Support Break ({round(support, 3)}) + Bearish Confirm",
-            "confidence": 0.85,
-        }
-
-def check_for_setups():
-    print("🔍 Checking setups...")
-    try:
-        for symbol in [SYMBOL_XAU, SYMBOL_BTC]:
-            raw = twelvedata_get_series(symbol, "15min", 200)
-            candles = parse_candles(raw)
-            detect = detect_sweep_and_red(candles)
-            if detect["signal"]:
-                if symbol == SYMBOL_XAU:
-                    plan = build_short_plan(symbol, candles, detect, XAU_SL_PIPS)
-                    current_setups["XAU"] = plan
-                else:
-                    plan = build_short_plan(symbol, candles, detect, BTC_SL_USD/10)
-                    current_setups["BTC"] = plan
-                print(f"✅ {symbol} short setup detected")
-    except Exception as e:
-        print("Setup error:", e)
-
-def check_entry_zones():
-    print("🎯 Checking entry zones...")
-    for key, setup in current_setups.items():
-        if not setup:
-            continue
-        current_price = get_current_price(setup["symbol"])
-        if current_price is None:
-            continue
-        diff = abs(current_price - setup["entry"]) / setup["entry"] * 100
-        if diff <= 0.1:
-            send_telegram_message(format_alert(setup, current_price))
-            current_setups[key] = None
-
-def format_alert(setup, price):
-    return (f"🚨 <b>{setup['symbol']} SHORT ENTRY ALERT</b>\n"
-            f"💰 Price: {price}\n🎯 Entry: {setup['entry']}\n"
-            f"SL: {setup['sl']} | TP: {setup['tp']}\nLogic: {setup['logic']}\n"
-            f"Confidence: {int(setup['confidence']*100)}%\n\n⚡ Ready for entry!")
-
-# ------------------ JOBS ------------------
+# ------------------ CORE JOBS ------------------
 
 def job_pre_alert():
     now = datetime.utcnow() + timedelta(hours=5)
-    msg = f"🕒 <b>Pre-NY Short Bias Scan</b>\nTime: {now.strftime('%H:%M')}"
-    send_telegram_message(msg)
+    send_telegram_message(f"🕒 <b>Pre-NY Session</b>\nTime (PK): {now.strftime('%H:%M')}")
+    try:
+        raw_15m_xau = twelvedata_get_series(SYMBOL_XAU, "15min", 96)
+        candles = parse_candles(raw_15m_xau)
+        liq = compute_liquidity_zones(candles)
+        send_telegram_message(f"📊 <b>XAU/USD Liquidity</b>\nLow: {liq['recent_low']}\nHigh: {liq['recent_high']}\nLast: {liq['last_close']}")
+    except Exception as e:
+        send_telegram_message(f"Pre-alert error: {e}")
 
-def job_monitor():
+def job_continuous_monitoring():
     now_pk = datetime.utcnow() + timedelta(hours=5)
     if NY_SESSION_START_PK <= now_pk.time() <= NY_SESSION_END_PK:
-        print(f"🕐 NY Active {now_pk.strftime('%H:%M')}")
-        check_for_setups()
-        check_entry_zones()
+        print(f"🕒 Monitoring {now_pk.strftime('%H:%M')}")
+    else:
+        print("💤 Outside NY session hours")
 
 def start_scheduler():
     sched = BackgroundScheduler(timezone="UTC")
-    sched.add_job(job_pre_alert, "cron", hour=11, minute=55)
-    sched.add_job(job_monitor, "interval", minutes=5)
+    sched.add_job(job_pre_alert, 'cron', hour=11, minute=55)
+    sched.add_job(job_continuous_monitoring, 'interval', minutes=5)
     sched.start()
-    print("🤖 Short Setup Bot running...")
-    while True:
-        time.sleep(1)
+    print("🤖 Bot Running...")
+    try:
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        sched.shutdown()
 
 if __name__ == "__main__":
+    print("Starting Liquidity Matrix Bot...")
     start_scheduler()
+
